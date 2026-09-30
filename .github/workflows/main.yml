@@ -1,0 +1,136 @@
+name: aospdtgen Device Tree
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "رابط الروم (Direct / Google Drive / Mega) - ملف مضغوط فيه ملفات img"
+        required: true
+      device_name:
+        description: "اسم الجهاز (مثال: Infinix-Hot-40i)"
+        required: true
+        default: "Infinix-Hot-40i"
+      upload_gofile:
+        description: "رفع النتيجة إلى gofile"
+        type: boolean
+        default: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: تنظيف القرص لتوفير مساحة
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: تثبيت الأدوات
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-pip erofs-utils \
+            android-sdk-libsparse-utils p7zip-full unzip lz4 aria2 megatools file git
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install --upgrade pip
+          ~/venv/bin/pip install gdown git+https://github.com/sebaubuntu-python/aospdtgen
+
+      - name: تحميل الروم
+        run: |
+          mkdir -p ~/work/dl && cd ~/work/dl
+          URL="${{ github.event.inputs.firmware_url }}"
+          if [[ "$URL" == *"drive.google.com"* ]]; then
+            ~/venv/bin/gdown --fuzzy "$URL"
+          elif [[ "$URL" == *"mega.nz"* ]]; then
+            megatools dl "$URL"
+          else
+            aria2c -x16 -s16 -o firmware_file "$URL"
+          fi
+          ls -lh
+
+      - name: فك ضغط الروم
+        run: |
+          mkdir -p ~/work/fw && cd ~/work/dl
+          for f in *; do
+            case "$f" in
+              *.zip) unzip -o "$f" -d ~/work/fw ;;
+              *.7z|*.rar|*.tar|*.tar.gz|*.tgz|*.xz) 7z x -y "$f" -o$HOME/work/fw ;;
+              *.img) cp "$f" ~/work/fw/ ;;
+              *) 7z x -y "$f" -o$HOME/work/fw || cp "$f" ~/work/fw/ ;;
+            esac
+          done
+          rm -rf ~/work/dl
+          find ~/work/fw -name "*.img*" | head -50
+          df -h /
+
+      - name: تجهيز الـ dump من ملفات img
+        run: |
+          mkdir -p ~/work/dump ~/work/mnt
+          cd ~/work/fw
+
+          # فك super.img إن وُجد
+          SUPER=$(find . -name "super.img" | head -1)
+          if [ -n "$SUPER" ]; then
+            git clone --depth=1 https://github.com/unix3dgforce/lpunpack ~/lpunpack || true
+            simg2img "$SUPER" super.raw.img 2>/dev/null || cp "$SUPER" super.raw.img
+            ~/venv/bin/python ~/lpunpack/lpunpack.py super.raw.img ./super_out || true
+            cp super_out/*.img . 2>/dev/null || true
+            rm -f super.raw.img "$SUPER"
+          fi
+
+          # فك lz4 إن وُجد
+          for z in $(find . -name "*.img.lz4"); do lz4 -d -f "$z" "${z%.lz4}"; rm -f "$z"; done
+
+          # صور الإقلاع تُنسخ كما هي
+          for b in boot vendor_boot init_boot dtbo recovery vbmeta; do
+            f=$(find . -maxdepth 2 -name "$b.img" | head -1)
+            [ -n "$f" ] && cp "$f" ~/work/dump/
+          done
+
+          # أقسام النظام تُفك إلى مجلدات
+          for p in system system_ext product vendor odm vendor_dlkm odm_dlkm system_dlkm; do
+            img=$(find . -maxdepth 3 -name "$p.img" | head -1)
+            [ -z "$img" ] && continue
+            echo "==> $p"
+            simg2img "$img" "$p.raw" 2>/dev/null || cp "$img" "$p.raw"
+            mkdir -p ~/work/dump/$p
+            if fsck.erofs --extract=$HOME/work/dump/$p "$p.raw" >/dev/null 2>&1; then
+              echo "$p: erofs"
+            else
+              sudo mount -o loop,ro "$p.raw" ~/work/mnt
+              sudo cp -a ~/work/mnt/. ~/work/dump/$p/
+              sudo umount ~/work/mnt
+              echo "$p: ext4"
+            fi
+            rm -f "$p.raw" "$img"
+          done
+          sudo chown -R $USER:$USER ~/work/dump
+          ls ~/work/dump
+          df -h /
+
+      - name: تشغيل aospdtgen
+        run: |
+          mkdir -p ~/work/out
+          ~/venv/bin/python -m aospdtgen ~/work/dump -o ~/work/out
+          find ~/work/out -maxdepth 4 | head -50
+
+      - name: ضغط النتيجة
+        run: |
+          cd ~/work
+          zip -r "${{ github.event.inputs.device_name }}-device-tree.zip" out
+          ls -lh *.zip
+
+      - name: رفع كـ Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.device_name }}-device-tree
+          path: ~/work/*.zip
+
+      - name: رفع إلى gofile
+        if: ${{ github.event.inputs.upload_gofile == 'true' }}
+        continue-on-error: true
+        run: |
+          cd ~/work
+          SERVER=$(curl -s https://api.gofile.io/servers | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['servers'][0]['name'])")
+          curl -s -F "file=@$(ls *.zip)" "https://${SERVER}.gofile.io/contents/uploadfile" | tee gofile.json
+          echo "### رابط gofile" >> $GITHUB_STEP_SUMMARY
+          python3 -c "import json;print(json.load(open('gofile.json'))['data']['downloadPage'])" >> $GITHUB_STEP_SUMMARY
